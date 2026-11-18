@@ -9,7 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
 ENV DATA_DIR=/data
-VOLUME /data
+# Cold archival target: a separate mounted volume (docker-compose mounts
+# cold-data at /cold). Empty means "no cold volume configured"; uploads,
+# publishing and downloads still work, only archival is unavailable.
+ENV COLD_VOLUMES=cold-local=/cold
+VOLUME ["/data", "/cold"]
 EXPOSE 8000
 
 # 两个 worker 进程共享同一 SQLite(WAL) 与数据目录，

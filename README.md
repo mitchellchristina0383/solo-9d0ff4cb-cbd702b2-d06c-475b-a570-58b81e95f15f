@@ -11,6 +11,40 @@
 - 缺块可补传；摘要不符 **拒绝发布** 并提示重新创建任务
 - 多进程并发上传/提交、磁盘写失败、进程重启均不会发布残缺文件或产生两份成品
 - 已发布的包重启后仍可下载
+- **单包冷归档**：已发布的包可经网页核对大小与 SHA-256 后移入独立冷卷，页面显示所在卷；
+  下载地址保持不变。迁移前已开始、迁移中发起的下载都能连续取得完整文件
+- 归档失败/进程中断时原包仍在热卷可下载；重试与重启不会误报成功或删除唯一可用副本
+- 上传与发布流程不受影响，可同时继续使用
+
+## 冷归档
+
+给值班工程师的日常操作：结案后把该事故的诊断包从热卷移到冷卷腾出空间。
+
+1. 在任务列表找到 **已发布** 的任务。
+2. 选择冷卷，勾选"已核对大小与 SHA-256"（列表里同时显示 `size` 与 `sha256` 供比对）。
+3. 点"归档到冷卷"。成功后该任务标记为 **冷卷 `<名称>`**，热卷成品被删除，
+   `/api/tasks/{id}/download` 地址与内容都不变。
+
+归档顺序（任何一步失败或崩溃都不会丢包）：
+
+```
+校验热卷源(大小+SHA-256) → 复制到冷卷 .staging/ → fsync → 校验副本
+  → 原子改名到 <冷卷>/<task_id> → 记录 archived(冷副本已存在)
+  → 记录 storage=cold(下载改走冷卷) → 删除热卷成品
+```
+
+- 第 5 步之前中断：热卷文件与路由都不变，`archive_state` 在重启时清回 NULL，可直接重试。
+- 第 5 步与第 6 步之间中断：下载仍走热卷（文件完好），重试时再次校验冷副本并补完切换。
+- 删除热卷成品失败：冷副本已校验并生效，任务仍显示已归档，重试会补删热卷成品。
+- 两个进程同时归档同一任务：per-task `flock` 串行化；**后到者等锁拿 DB 最新状态后直接返回已归档**，
+  不会并发写出第二份冷副本，也不会在冷副本未校验前删除热卷成品（冷卷上若已有他人落地的副本，
+  会先重新校验再复用）。
+- 冷卷上 `<冷卷>/<task_id>` 只会在副本校验通过后原子出现；`.staging/` 中的半成品
+  在失败时删除、进程重启时按任务锁清理（不会误删其他进程正在写的暂存文件）。
+
+冷卷通过 `COLD_VOLUMES` 配置，格式 `名称=路径[,名称=路径 ...]`，可配置多个；
+未指定卷时自动选择剩余空间最大的可用卷。冷卷路径必须与热卷属于不同文件系统，
+否则"移出热卷"没有意义。未配置冷卷时其余功能照常，只有归档返回 503。
 
 ## 快速开始
 
@@ -22,15 +56,28 @@ docker compose up --build
 ```
 
 容器内以 `--workers 2` 运行两个服务进程，共享挂载卷中的 SQLite 与数据目录。
+热卷为 `uploader-data`（挂到 `/data`），冷卷为独立的 `cold-data`（挂到 `/cold`），
+两者是不同文件系统，可在网页上直接执行冷归档。
+
+清理本地数据（含冷卷）：
+
+```bash
+docker compose down -v
+```
 
 ### 本地开发
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
+mkdir -p /tmp/cold && \
+DATA_DIR=data COLD_VOLUMES="cold-local=/tmp/cold" \
+  .venv/bin/uvicorn app.main:app --port 8000
 # 打开 http://localhost:8000
 ```
+
+冷卷与热卷应位于不同文件系统（本地开发可用单独的挂载点或 tmpfs），
+否则归档只是复制，不节省热卷空间。
 
 ## API
 
@@ -41,9 +88,13 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 | GET | `/api/tasks/{id}` | 任务详情：`received_chunks` / `missing_chunks` / `state` |
 | PUT | `/api/tasks/{id}/chunks/{i}` | 上传第 i 块（1 MiB，最后一块按实际大小）。同内容重传返回 `deduplicated:true`；异内容 409 |
 | POST | `/api/tasks/{id}/finalize` | 核对分块+大小+摘要，通过则发布；缺块返回 409+`missing_chunks`；摘要不符标记 `failed` |
-| GET | `/api/tasks/{id}/download` | 下载已发布的包（未发布返回 409） |
+| GET | `/api/tasks/{id}/download` | 下载已发布的包（未发布返回 409）。与是否归档无关，地址不变 |
+| POST | `/api/tasks/{id}/archive` | 冷归档 `{volume?}`：核对大小+SHA-256，复制到冷卷并校验后切换下载，再删热卷成品。幂等；冷卷不可用 503，非已发布 409 |
+| GET | `/api/storage` | 已配置冷卷的名称、路径、可用性与剩余空间 |
 
 任务状态机：`uploading` → `published`（终态）/ `failed`（终态，摘要不符）。
+已发布任务另有归档字段：`storage`（`hot`/`cold`）、`volume`、`archive_state`
+（`null`/`copying`/`archived`）、`archive_error`、`archived_at`、`hot_deleted`。
 
 ## 一致性设计
 
@@ -52,6 +103,10 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 - **多进程互斥**：finalize 用 per-task `flock` 串行化；SQLite WAL + busy_timeout 处理并发写。两个进程同时提交，只会有一个完成校验-改名-置态，另一个读到已发布直接返回。
 - **崩溃恢复**：状态全在 SQLite（synchronous=FULL）与磁盘。重启后已收分块保留；DB 有记录但文件丢失的块（INSERT 后、改名前崩溃）在 finalize 时被发现并允许补传。
 - **磁盘写失败**：改名失败即回滚 DB 记录并返回 500，任务保持 `uploading`，不会产生半成品。
+- **归档原子性**：冷副本先写 `.staging/` 并 fsync+校验，再原子改名；DB 先记 `archived`
+  再切 `storage=cold`，最后才删热卷成品。任何时刻下载只会路由到一份校验过的完整文件。
+- **在途下载**：下载打开文件描述符后从该描述符流式读取，删除热卷文件不影响已开始的传输；
+  路由切换与下载读取之间若发生竞争，下载会重新读取路由并按新位置打开。
 
 ## 测试
 
@@ -59,15 +114,22 @@ DATA_DIR=data .venv/bin/uvicorn app.main:app --port 8000
 .venv/bin/python -m pytest tests/ -v
 ```
 
-- `tests/test_app.py`（14 项）：完整流程、续传、幂等去重、异内容拒绝、缺块补传、摘要拒绝、磁盘失败注入（chunk 上传 / finalize 两条路径）、重启恢复、空文件、参数校验。
-- `tests/test_live.py`（3 项）：两个 uvicorn 进程并发上传/并发提交同一任务、kill -9 后重启续传、已发布包重启后可下载、跨进程同块并发去重。
+- `tests/test_app.py`（30 项）：完整流程、续传、幂等去重、异内容拒绝、缺块补传、摘要拒绝、磁盘失败注入（chunk 上传 / finalize 两条路径）、重启恢复、空文件、参数校验；冷归档：归档后下载地址不变、页面字段、幂等、无冷卷 503、改名/复制/校验失败后热卷完好且可重试、两个崩溃窗口的重启恢复、暂存清理、归档时删除热卷不影响在途下载、旧库迁移。
+- `tests/test_live.py`（6 项）：两个 uvicorn 进程并发上传/并发提交同一任务、kill -9 后重启续传、已发布包重启后可下载、跨进程同块并发去重；冷归档：两个进程同时归档同一包且迁移前/迁移中有多个下载在途（全部得到完整文件、只留一份冷副本、热卷成品删除）、归档复制中 kill -9 后重启（不误报成功、原包可下载、重试成功）、只读冷卷写失败后重试成功。
 
 ## 数据布局（`DATA_DIR`）
 
 ```
 uploader.db        SQLite（WAL）
 chunks/<task>/     已收分块
-published/<task>   校验通过后的成品（原子改名出现）
+published/<task>   校验通过后的成品（原子改名出现；归档成功后删除）
 tmp/               临时文件（启动时清理超过 1 小时的残留）
 locks/             per-task flock 文件
+```
+
+冷卷（`COLD_VOLUMES`，独立文件系统）：
+
+```
+<冷卷>/<task_id>     校验通过后的冷副本（原子改名出现）
+<冷卷>/.staging/     归档复制中的暂存文件（失败即删；重启按任务锁清理）
 ```

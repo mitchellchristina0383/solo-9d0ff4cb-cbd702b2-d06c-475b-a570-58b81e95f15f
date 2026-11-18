@@ -23,6 +23,13 @@
   .st-uploading { background: #f0ad4e22; color: #b87a10; border: 1px solid #b87a1088; }
   .st-published { background: #2e7d3222; color: #2e7d32; border: 1px solid #2e7d3288; }
   .st-failed    { background: #c6282822; color: #c62828; border: 1px solid #c6282888; }
+  .st-hot       { background: #1976d222; color: #1565c0; border: 1px solid #1565c088; }
+  .st-cold      { background: #6a1b9a22; color: #6a1b9a; border: 1px solid #6a1b9a88; }
+  .st-archiving { background: #f0ad4e22; color: #b87a10; border: 1px solid #b87a1088; }
+  .st-archivefail { background: #c6282822; color: #c62828; border: 1px solid #c6282888; }
+  .archive { border-top: 1px dashed #8885; margin-top: 10px; padding-top: 10px; }
+  select { padding: 6px 8px; border-radius: 6px; border: 1px solid #8888; }
+  label.check { display: flex; gap: 6px; align-items: flex-start; font-size: .88rem; }
   .task { border: 1px solid #8884; border-radius: 8px; padding: 12px; margin: 10px 0; }
   .bar { height: 8px; background: #8883; border-radius: 4px; overflow: hidden; margin: 6px 0; }
   .bar > div { height: 100%; background: #2e7d32; width: 0; transition: width .2s; }
@@ -36,9 +43,15 @@
 </style>
 </head>
 <body>
-<h1>事故诊断包上传（1 MiB 分块 · 断点续传 · 校验后发布）</h1>
+<h1>事故诊断包上传（1 MiB 分块 · 断点续传 · 校验后发布 · 冷归档）</h1>
 <p class="muted">创建任务时提交文件大小与 SHA-256；分块上传，刷新或重开页面后可查看已收分块并补齐；
-提交完成时服务端核对分块、总大小与摘要，全部通过才开放下载。摘要不符将拒绝发布，需重新创建任务。</p>
+提交完成时服务端核对分块、总大小与摘要，全部通过才开放下载。摘要不符将拒绝发布，需重新创建任务。
+已发布的包可核对大小与 SHA-256 后归档到独立冷卷，下载地址保持不变；归档失败或中断时原包仍在热卷可下载，可直接重试。</p>
+
+<section>
+  <h2>冷卷</h2>
+  <div id="storageInfo" class="muted">加载中…</div>
+</section>
 
 <section>
   <h2>1. 选择文件并创建任务</h2>
@@ -74,6 +87,10 @@ const hexOf = buf => [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2
 const fmtSize = n => n >= 1048576 ? (n/1048576).toFixed(2) + " MiB" : (n/1024).toFixed(1) + " KiB";
 
 let pickedFile = null, pickedSha = null;
+let coldVolumes = [];
+
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 async function api(method, url, body) {
   const opt = { method };
@@ -193,8 +210,9 @@ function taskCard(t) {
   div.className = "task";
   const pct = t.total_chunks ? Math.round(100 * t.received_count / t.total_chunks) : 100;
   div.innerHTML = `
-    <div><b>${t.filename}</b> · ${fmtSize(t.size)}
-      <span class="badge st-${t.state}">${{uploading:"上传中",published:"已发布",failed:"已拒绝"}[t.state]}</span></div>
+    <div><b>${esc(t.filename)}</b> · ${fmtSize(t.size)}
+      <span class="badge st-${t.state}">${{uploading:"上传中",published:"已发布",failed:"已拒绝"}[t.state]}</span>
+      ${volumeBadge(t)}</div>
     <div class="mono muted">id: ${t.task_id}<br>sha256: ${t.sha256}</div>
     <div class="bar"><div id="bar-${t.task_id}" style="width:${pct}%"></div></div>
     <div class="muted">分块 ${t.received_count}/${t.total_chunks}</div>
@@ -203,9 +221,10 @@ function taskCard(t) {
       ${t.state === "uploading" ? `
         <label>选择文件续传 <input type="file" id="re-${t.task_id}" style="display:none"></label>
         <button id="fin-${t.task_id}">提交完成</button>` : ""}
-      ${t.state === "published" ? `<a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${t.filename}</a>` : ""}
+      ${t.state === "published" ? `<a class="dl" href="/api/tasks/${t.task_id}/download">下载 ${esc(t.filename)}</a>` : ""}
       ${t.state === "failed" ? `<span class="msg err">摘要校验未通过，已拒绝发布，请重新创建任务。</span>` : ""}
     </div>
+    ${t.state === "published" ? archiveSection(t) : ""}
     <div class="msg" id="msg-${t.task_id}"></div>`;
   if (t.state === "uploading") {
     div.querySelector(`#re-${t.task_id}`).onchange = ev => {
@@ -214,7 +233,95 @@ function taskCard(t) {
     };
     div.querySelector(`#fin-${t.task_id}`).onclick = () => finalizeTask(t.task_id);
   }
+  if (t.state === "published") {
+    const btn = div.querySelector(`#arc-${t.task_id}`);
+    const ack = div.querySelector(`#ack-${t.task_id}`);
+    if (btn && ack) {
+      ack.onchange = () => { btn.disabled = !ack.checked || !coldVolumes.some(v => v.available); };
+    }
+    if (btn) btn.onclick = () => archiveTask(t);
+  }
   return div;
+}
+
+function volumeBadge(t) {
+  if (t.storage === "cold") {
+    return `<span class="badge st-cold">冷卷 ${esc(t.volume || t.archive_target || "?")}</span>`;
+  }
+  if (t.archive_state === "copying") {
+    return `<span class="badge st-archiving">归档中</span>`;
+  }
+  if (t.archive_state === "archived") {
+    return `<span class="badge st-archiving">已归档 · 待清理热卷</span>`;
+  }
+  if (t.archive_error) {
+    return `<span class="badge st-archivefail">归档失败</span>`;
+  }
+  return `<span class="badge st-hot">热卷</span>`;
+}
+
+function archiveSection(t) {
+  if (t.storage === "cold") {
+    return `
+      <div class="archive muted">
+        所在卷：<b>${esc(t.volume || t.archive_target)}</b>（冷）
+        ${t.archived_at ? "· 归档于 " + esc(t.archived_at) : ""}
+        ${t.hot_deleted ? "· 热卷副本已删除" : "· 热卷副本待清理（可重试归档）"}
+        <br>下载地址不变：<span class="mono">/api/tasks/${t.task_id}/download</span>
+      </div>`;
+  }
+  const opts = coldVolumes
+    .map(v => `<option value="${esc(v.name)}"${v.available ? "" : " disabled"}>${esc(v.name)}${v.available ? "" : "（不可用）"}</option>`)
+    .join("");
+  return `
+    <div class="archive">
+      <div class="muted">归档到冷卷：先核对大小与 SHA-256，冷卷副本写稳并通过校验、下载切换到冷卷后才删除热卷成品。</div>
+      ${t.archive_error ? `<div class="msg err">上次归档失败：${esc(t.archive_error)}（原包仍在热卷可下载，可重试）</div>` : ""}
+      <div class="row">
+        ${coldVolumes.length ? `<select id="vol-${t.task_id}">${opts}</select>` : `<span class="msg err">未配置冷卷</span>`}
+        <label class="check"><input type="checkbox" id="ack-${t.task_id}">
+          已核对大小 ${t.size} 字节与 SHA-256</label>
+        <button id="arc-${t.task_id}" disabled>归档到冷卷</button>
+      </div>
+    </div>`;
+}
+
+async function archiveTask(t) {
+  const volEl = document.querySelector(`#vol-${t.task_id}`);
+  const btn = document.querySelector(`#arc-${t.task_id}`);
+  const ack = document.querySelector(`#ack-${t.task_id}`);
+  const msgEl = document.querySelector(`#msg-${t.task_id}`);
+  if (!ack || !ack.checked) return;
+  const volume = volEl ? volEl.value : null;
+  if (!volume) { if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = "请选择冷卷。"; } return; }
+  if (btn) btn.disabled = true;
+  if (msgEl) { msgEl.className = "msg"; msgEl.textContent = `正在复制并校验到冷卷 ${volume}…`; }
+  try {
+    const r = await api("POST", `/api/tasks/${t.task_id}/archive`, { volume });
+    if (msgEl) {
+      msgEl.className = "msg ok";
+      msgEl.textContent = r.storage === "cold"
+        ? `已归档到冷卷 ${r.volume}${r.hot_deleted ? "，热卷副本已删除" : "；热卷副本待重试清理"}。下载地址不变。`
+        : "归档完成。";
+    }
+  } catch (e) {
+    if (msgEl) { msgEl.className = "msg err"; msgEl.textContent = "归档失败：" + e.message + "（原包仍在热卷可下载，可重试）"; }
+  }
+  await refreshStorage();
+  await refreshTasks();
+}
+
+async function refreshStorage() {
+  const el = $("storageInfo");
+  try {
+    const { volumes } = await api("GET", "/api/storage");
+    coldVolumes = volumes || [];
+    if (!coldVolumes.length) { el.textContent = "未配置冷卷（COLD_VOLUMES）；已发布包仍可正常上传/发布/下载。"; return; }
+    el.innerHTML = coldVolumes.map(v =>
+      `<div class="mono">${esc(v.name)} · ${esc(v.path)} · ` +
+      (v.available ? `可用，剩余 ${v.free_bytes >= 0 ? fmtSize(v.free_bytes) : "未知"}` : "不可用") +
+      `</div>`).join("");
+  } catch (e) { el.textContent = "冷卷信息加载失败: " + e.message; }
 }
 
 async function refreshTasks() {
@@ -244,7 +351,8 @@ async function refreshTasks() {
   }
 }
 
-$("refreshBtn").onclick = refreshTasks;
+$("refreshBtn").onclick = () => { refreshStorage(); refreshTasks(); };
+refreshStorage();
 refreshTasks();
 </script>
 </body>

@@ -6,9 +6,18 @@ services:
       - "8000:8000"
     environment:
       DATA_DIR: /data
+      # Hot root is /data. Cold archival moves published products to a
+      # separate volume mounted at /cold (see the cold-data volume below).
+      COLD_VOLUMES: "cold-local=/cold"
     volumes:
       - uploader-data:/data
+      # Independent cold volume: a Docker-managed volume mounted at /cold, so
+      # hot and cold are distinct filesystems. Remove/replace this volume to
+      # simulate cold-volume loss; the hot copy is untouched until archival
+      # fully succeeds.
+      - cold-data:/cold
     restart: unless-stopped
 
 volumes:
   uploader-data:
+  cold-data:
